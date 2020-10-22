@@ -2,275 +2,185 @@ package main
 
 import (
 	"bytes"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/base64"
-	"encoding/json"
-	"encoding/pem"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"os"
-	"strings"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"sync"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/taskcluster/taskcluster/v37/clients/client-go/tcsecrets"
+	"github.com/taskcluster/taskcluster/v37/clients/client-go/tcworkermanager"
 )
 
-var secrets *tcsecrets.Secrets
+type (
+	// WorkerPools is a mapping from worker pool name to its definition
+	WorkerPools map[string]tcworkermanager.WorkerPoolFullDefinition
+)
 
-const secretsPrefix = "project/taskcluster/aws-provisioner-v1/worker-types/ssh-keys/"
+func ExitOnError(err error) {
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+}
+
+func ConfigureLogging() {
+	// Errors should be prefixed by the name of the executable, and no
+	// timestamps etc
+	log.SetFlags(0)
+	log.SetPrefix(filepath.Base(os.Args[0]) + ": ")
+}
+
+// ImageSetDirs returns a directory listing of the community-tc/imagesets
+// directory inside the password store
+func ImageSetDirs() ([]os.FileInfo, error) {
+	// Check `pass` is installed and configured, and that imagesets directory
+	// exists. Note: it is the users responsibility to `pass git pull`.
+	passwordStoreDir := os.Getenv("PASSWORD_STORE_DIR")
+	if passwordStoreDir == "" {
+		passwordStoreDir = filepath.Join(os.Getenv("HOME"), ".password-store")
+	}
+	imageSetsDir := filepath.Join(passwordStoreDir, "community-tc", "imagesets")
+	imageSetDirs, err := ioutil.ReadDir(imageSetsDir)
+	if err != nil {
+		return nil, fmt.Errorf("Cannot find rsa keys for workers in directory %v - have you installed/configured pass (passwordstore.org)? %v", imageSetsDir, err)
+	}
+	return imageSetDirs, nil
+}
 
 func main() {
-	var err error
-	secrets = tcsecrets.NewFromEnv()
-	s, err := secrets.List("", "")
-	if err != nil {
-		log.Fatalf("Could not read secrets: '%v'", err)
-	}
-	if len(s.Secrets) == 0 {
-		log.Fatalf("Taskcluster secrets service returned zero secrets, but auth did not fail, so it seems your client (%v) does not have scopes\nfor getting existing secrets (recommended: \"secrets:get:project/taskcluster/aws-provisioner-v1/worker-types/ssh-keys/*\")", secrets.Credentials.ClientID)
-	}
+	ConfigureLogging()
+
+	// Take taskcluster connection details from TASKCLUSTER_* env variables
+	workerManager := tcworkermanager.NewFromEnv()
+
+	imageSetDirs, err := ImageSetDirs()
+	ExitOnError(err)
+	allWorkerPools, err := AllWorkerPools(workerManager)
+	ExitOnError(err)
+	workerPools, err := FilterWorkerPools(os.Args[1:], allWorkerPools)
+	ExitOnError(err)
+
+	workerPoolBuffers := make([]*bytes.Buffer{}, 0, len(workerPools))
 	var wg sync.WaitGroup
-	workerTypeBuffers := []*bytes.Buffer{}
-	for _, name := range s.Secrets {
-		if strings.HasPrefix(name, secretsPrefix) {
-			workerType := name[len(secretsPrefix):]
-			if shouldInclude(workerType) {
-				wg.Add(1)
-				b := &bytes.Buffer{}
-				workerTypeBuffers = append(workerTypeBuffers, b)
-				go func(workerType, name string, b *bytes.Buffer) {
-					defer wg.Done()
-					fetchWorkerType(workerType, name, b)
-				}(workerType, name, b)
-			}
-		}
+	wg.Add(len(workerPools))
+
+	Title("Worker Pools")
+	for _, workerPoolName := range workerPools.SortedNames() {
+		b := &bytes.Buffer{}
+		workerPoolBuffers = append(workerPoolBuffers, b)
+		fmt.Fprintln(b, workerPoolName)
+		go func(workerPool, b *bytes.Buffer) {
+			defer wg.Done()
+			FetchWorkerPool(workerManager, workerPool, name, b)
+		}(workerPool, b)
 	}
 	wg.Wait()
-	for _, b := range workerTypeBuffers {
+	for _, b := range workerPoolBuffers {
 		fmt.Print(b.String())
 	}
 }
 
-func shouldInclude(workerType string) bool {
-	// os.Args[0] is program name ("occ-workers"). No other args means run
-	// against all worker types.
-	if len(os.Args) <= 1 {
-		return true
+func FetchWorkerPool(workerManager *tcworkermanager.WorkerManager, workerPool string, out io.Writer) {
+	workers, err := AllWorkerPoolWorkers(workerManager, workerPoolName)
+	ExitOnError(err)
+	workerPool := workerPools[workerPoolName]
+	switch workerPool.ProviderID {
+	case "community-tc-workers-aws":
+		LogAWS(out, workerPool.Config)
+	case "community-tc-workers-google":
+		LogGoogle(out, workerPool.Config)
+	case "static":
+		LogStatic(out, workerPool.Config)
+	default:
+		LogUnknown(out, workerPool.Config)
 	}
-	// Worker types have been specified on command line, therefore only allow
-	// workerType if it is included in program args. Avoid `for range`
-	// construct as we are skipping first element os.Args[0].
-	for i := 1; i < len(os.Args); i++ {
-		if os.Args[i] == workerType {
-			return true
-		}
-	}
-	return false
-}
-
-func fetchWorkerType(workerType, name string, out *bytes.Buffer) {
-	out.WriteString(fmt.Sprintf("\nWorker type: %v\n", workerType))
-	out.WriteString(strings.Repeat("=", len(workerType)+13) + "\n")
-	secret, err := secrets.Get(name)
-	if err != nil {
-		out.WriteString(fmt.Sprintf("Could not read secret %v: '%v'\n", name, err))
-		return
-	}
-	var data map[string]interface{}
-	err = json.Unmarshal(secret.Secret, &data)
-	if err != nil {
-		out.WriteString(fmt.Sprintf("Could not unmarshal data %v: '%v'\n", string(secret.Secret), err))
-		return
-	}
-	var wg sync.WaitGroup
-	regionBuffers := make([]*bytes.Buffer, len(data))
-	c := 0
-	for region, rsaKey := range data {
-		regionBuffers[c] = &bytes.Buffer{}
-		wg.Add(1)
-		go func(region string, rsaKey interface{}, b *bytes.Buffer) {
-			defer wg.Done()
-			fetchRegion(workerType, region, rsaKey, b)
-		}(region, rsaKey, regionBuffers[c])
-		c++
-	}
-	wg.Wait()
-	for _, b := range regionBuffers {
-		out.WriteString(b.String())
+	for _, worker := range workers {
+		fmt.Fprintln(out, worker.WorkerID)
 	}
 }
 
-func fetchRegion(workerType string, region string, rsaKey interface{}, out *bytes.Buffer) {
-	out.WriteString(fmt.Sprintf("Region: %v\n", region))
-	block, _ := pem.Decode([]byte(rsaKey.(string)))
-	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-	if err != nil {
-		out.WriteString(fmt.Sprintf("Could not interpret rsa key data '%v': '%v'\n", rsaKey, err))
-		return
+// Title writes three lines to standard out: a blank line, title, and a string
+// of '=' characters with length of title
+func Title(title string) {
+	fmt.Println("")
+	fmt.Println(title)
+	for range title {
+		fmt.Print("=")
 	}
-	sess, _ := session.NewSession()
-	svc := ec2.New(sess, &aws.Config{Region: aws.String(region)})
-	inst, err := svc.DescribeInstances(
-		&ec2.DescribeInstancesInput{
-			Filters: []*ec2.Filter{
-				{
-					Name: aws.String("tag:Name"),
-					Values: []*string{
-						aws.String(workerType + " base instance"),
-					},
-				},
-				{
-					Name: aws.String("tag:TC-Windows-Base"),
-					Values: []*string{
-						aws.String("true"),
-					},
-				},
-				// filter out terminated instances
-				{
-					Name: aws.String("instance-state-name"),
-					Values: []*string{
-						aws.String("pending"),
-						aws.String("running"),
-						aws.String("shutting-down"),
-						aws.String("stopping"),
-						aws.String("stopped"),
-					},
-				},
-			},
-		},
-	)
-	if err != nil {
-		out.WriteString(fmt.Sprintf("Could not query AWS for instances in region %v for worker type %v: '%v'\n", region, workerType, err))
-		return
-	}
-	delimeter := ""
-	for _, r := range inst.Reservations {
-		for _, i := range r.Instances {
-			out.WriteString(fmt.Sprintf("  Base instance: %v\n", *i.InstanceId))
-			p, err := svc.GetPasswordData(
-				&ec2.GetPasswordDataInput{
-					InstanceId: i.InstanceId,
-				},
-			)
-			if err != nil {
-				out.WriteString(fmt.Sprintf("Could not query password for instance %v in region %v for worker type %v: '%v'\n", *i.InstanceId, region, workerType, err))
-				return
-			}
-			d, err := base64.StdEncoding.DecodeString(*p.PasswordData)
-			if err != nil {
-				out.WriteString(fmt.Sprintf("Could not base64 decode encrypted password '%v': '%v'\n", *p.PasswordData, err))
-				return
-			}
-			b, err := rsa.DecryptPKCS1v15(
-				nil,
-				key,
-				d,
-			)
-			if err != nil {
-				out.WriteString(fmt.Sprintf("Could not decrypt password - probably somebody is rebuilding AMIs and the keys in the secret store haven't been updated yet (key: %#v, encrypted password: %#v) for instance %v in region %v for worker type %v: '%v'", rsaKey, *p.PasswordData, *i.InstanceId, region, workerType, err))
-				return
-			}
-			for _, ni := range i.NetworkInterfaces {
-				if ni.Association != nil {
-					out.WriteString(fmt.Sprintf("    ssh Administrator@%v # (password: '%v')\n  --------------------------\n", *ni.Association.PublicIp, string(b)))
-				} else {
-					out.WriteString(fmt.Sprintf("    ssh Administrator@X.X.X.X # (No IP address assigned - is instance running? password: '%v')\n  --------------------------\n", string(b)))
-				}
-			}
+	fmt.Println("")
+}
 
-			for _, bdm := range i.BlockDeviceMappings {
-				snapshots, err := svc.DescribeSnapshots(
-					&ec2.DescribeSnapshotsInput{
-						Filters: []*ec2.Filter{
-							{
-								Name: aws.String("volume-id"),
-								Values: []*string{
-									bdm.Ebs.VolumeId,
-								},
-							},
-						},
-					},
-				)
-				if err != nil {
-					out.WriteString(fmt.Sprintf("Could not query snapshot for volume %v on instance %v in region %v for worker type %v: '%v'\n", *bdm.Ebs.VolumeId, *i.InstanceId, region, workerType, err))
-					return
-				}
-				for _, snap := range snapshots.Snapshots {
-					images, err := svc.DescribeImages(
-						&ec2.DescribeImagesInput{
-							Filters: []*ec2.Filter{
-								{
-									Name: aws.String("block-device-mapping.snapshot-id"),
-									Values: []*string{
-										snap.SnapshotId,
-									},
-								},
-							},
-						},
-					)
-					if err != nil {
-						out.WriteString(fmt.Sprintf("Could not query images that use snapshot %v from volume %v on instance %v in region %v for worker type %v: '%v'\n", *snap.SnapshotId, *bdm.Ebs.VolumeId, *i.InstanceId, region, workerType, err))
-						return
-					}
-					for _, image := range images.Images {
-						inst, err := svc.DescribeInstances(
-							&ec2.DescribeInstancesInput{
-								Filters: []*ec2.Filter{
-									{
-										Name: aws.String("image-id"),
-										Values: []*string{
-											image.ImageId,
-										},
-									},
-									{
-										Name: aws.String("instance-state-name"),
-										Values: []*string{
-											aws.String("running"),
-										},
-									},
-									// filter out terminated instances
-									{
-										Name: aws.String("instance-state-name"),
-										Values: []*string{
-											aws.String("pending"),
-											aws.String("running"),
-											aws.String("shutting-down"),
-											aws.String("stopping"),
-											aws.String("stopped"),
-										},
-									},
-								},
-							},
-						)
-						if err != nil {
-							out.WriteString(fmt.Sprintf("Could not query AWS for instances in region %v for worker type %v: '%v'\n", region, workerType, err))
-							return
-						}
-						for _, r := range inst.Reservations {
-							for _, i := range r.Instances {
-								delimeter = "  --------------------------\n"
-								out.WriteString(fmt.Sprintf("  Worker instance: %v (%v)\n", *i.InstanceId, *i.ImageId))
-								for _, ni := range i.NetworkInterfaces {
-									out.WriteString(fmt.Sprintf("    ssh Administrator@%v # (password: '%v')\n", *ni.Association.PublicIp, string(b)))
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// aws ec2 --region us-west-2 describe-snapshots --filters "Name=volume-id,Values=vol-96e7d12f" --query 'Snapshots[*].SnapshotId' --output text
-			// snap-a88dd3f0
-			// aws ec2 --region us-west-2 describe-images --filters "Name=block-device-mapping.snapshot-id,Values=snap-a88dd3f0" --query 'Images[*].ImageId' --output text
-			// ami-b00af7d0
-			// aws ec2 --region us-west-2 describe-instances --filters 'Name=image-id,Values=ami-b00af7d0' --query 'Reservations[*].Instances[*].InstanceId' --output text
-			// i-0027f0d020da43a95
-
+// AllWorkerPools fetches all Worker Pools from workerManager
+func AllWorkerPools(workerManager *tcworkermanager.WorkerManager) (WorkerPools, error) {
+	allWorkerPools := WorkerPools{}
+	continuationToken := ""
+	for {
+		workerPools, err := workerManager.ListWorkerPools(continuationToken, "")
+		if err != nil {
+			return nil, err
+		}
+		for _, workerPool := range workerPools.WorkerPools {
+			allWorkerPools[workerPool.WorkerPoolID] = workerPool
+		}
+		continuationToken = workerPools.ContinuationToken
+		if continuationToken == "" {
+			break
 		}
 	}
-	out.WriteString(delimeter)
+	return allWorkerPools, nil
+}
+
+// AllWorkerPoolWorkers fetches all workers of worker pool workerPool from
+// workerManager
+func AllWorkerPoolWorkers(workerManager *tcworkermanager.WorkerManager, workerPool string) ([]tcworkermanager.WorkerFullDefinition, error) {
+	workers := []tcworkermanager.WorkerFullDefinition{}
+	continuationToken := ""
+	for {
+		workersSubset, err := workerManager.ListWorkersForWorkerPool(workerPool, continuationToken, "")
+		if err != nil {
+			return nil, err
+		}
+		workers = append(workers, workersSubset.Workers...)
+		continuationToken = workersSubset.ContinuationToken
+		if continuationToken == "" {
+			break
+		}
+	}
+	return workers, nil
+}
+
+// FilterWorkerPools takes a list of POSIX regular expressions and a set of
+// worker pool definitions, and returns the subset of worker pool definitions
+// whose name match one of the regular expressions. If regularExpressions is
+// nil or has no elements, workerPools is returned.
+func FilterWorkerPools(regularExpressions []string, workerPools WorkerPools) (WorkerPools, error) {
+	// If no regular expressions, return all worker pools.
+	if len(regularExpressions) == 0 {
+		return workerPools, nil
+	}
+	filteredWorkerPools := WorkerPools{}
+	for i := range regularExpressions {
+		re, err := regexp.CompilePOSIX(regularExpressions[i])
+		if err != nil {
+			return nil, fmt.Errorf("Argument %q is not a valid POSIX ERE (egrep) regular expression: %v", regularExpressions[i], err)
+		}
+		for j := range workerPools {
+			if re.MatchString(workerPools[j].WorkerPoolID) {
+				filteredWorkerPools[workerPools[j].WorkerPoolID] = workerPools[j]
+			}
+		}
+	}
+	return filteredWorkerPools, nil
+}
+
+func (workerPools WorkerPools) SortedNames() []string {
+	workerPoolNames := make([]string, 0, len(workerPools))
+	for k := range workerPools {
+		workerPoolNames = append(workerPoolNames, k)
+	}
+	sort.Strings(workerPoolNames)
+	return workerPoolNames
 }
